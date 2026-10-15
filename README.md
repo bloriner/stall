@@ -74,8 +74,31 @@ Try the guardrails:
 Run the tests:
 
 ```bash
-python3 -m unittest discover -s tests   # 47 tests, all green
+python3 -m unittest discover -s tests          # sqlite backend (default)
+STALL_TEST_BACKEND=memory python3 -m unittest discover -s tests
 ```
+
+## Scale — v0.2
+
+v0.2 makes the seams right for many products and millions of customers.
+Full design: [`notes/scale-architecture.md`](notes/scale-architecture.md).
+
+- **Stateless MCP servers.** All session state (carts, spend ledger,
+  receipts) lives in the store — run N servers behind a load balancer.
+- **Storage abstraction** (`stall/store.py`): `MemoryStore` for tests,
+  `SQLiteStore` for durable single-node (FTS5 product search), Postgres
+  path documented for multi-node. `STALL_DB` env var selects the file;
+  `STALL_STORE=memory` selects in-memory.
+- **Atomic spend ledger.** `commit_purchase` checks caps and records spend
+  in ONE transaction — concurrent checkouts can't slip between check and
+  charge (proven by a 10-thread race test: exactly 3 of 10 $100 checkouts
+  win against a $300 daily cap; the ledger lands exactly on the cap).
+- **Firewall as a parallel worker.** `sanitize_listings` is a pure
+  per-listing function — at catalog scale it maps across a worker pool;
+  only sanitized listings ever touch the database.
+- **Identical ranking everywhere.** FTS5 narrows candidates; the
+  deterministic v0.1 ranker orders them, so results are byte-identical
+  across backends (verified by parity tests).
 
 ## Tools
 
@@ -95,24 +118,30 @@ merchants who don't want to run infrastructure. Future paid layers: the
 returns protocol, restock-agent subscriptions, merchant analytics
 ("how AI agents discover your products").
 
-## Honest status — v0.1
+## Honest status — v0.2
 
 - ✅ Listing firewall (schema + injection stripping + signed listings)
 - ✅ Spending guardrails + tamper-evident receipt chain
-- ✅ MCP server (stdio), demo merchant, 47 green tests
+- ✅ MCP server (stdio), demo merchant, 56 green tests (47 original × both
+  backends, + FTS relevance, + 10-thread ledger race, + 10k-catalog sanity)
+- ✅ Stateless server + SQLite store (FTS5 search) + atomic spend ledger
 - ❌ **Real payments are NOT implemented.** `stall_checkout` produces a signed
   *purchase-intent* receipt; no money moves. The x402 settlement rail is
   documented future work (see `notes/threat-model.md`).
 - ❌ No merchant onboarding / identity vetting yet (that's the MCP auth
   gateway's job).
-- ❌ Single demo merchant, in-memory carts and spend tracking.
+- ❌ Single demo merchant. Multi-merchant catalogs and the Postgres path
+  are designed (`notes/scale-architecture.md`) but not built.
+- ❌ Receipt chain can fork under concurrent checkouts (tamper-evidence
+  holds; sequencing is future work).
 
 ## Layout
 
 ```
-stall/            firewall.py · guardrails.py · catalog.py
-mcp/server.py     the MCP server (stdio NDJSON JSON-RPC)
+stall/            firewall.py · guardrails.py · catalog.py · store.py
+mcp/server.py     the MCP server (stdio NDJSON JSON-RPC, stateless)
 demo/             merchant.json · products.json · make_demo.py
 tests/            test_firewall.py · test_guardrails.py · test_server.py
-notes/            threat-model.md
+                  test_store.py (backends, race, scale sanity)
+notes/            threat-model.md · scale-architecture.md
 ```

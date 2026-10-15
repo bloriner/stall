@@ -15,6 +15,26 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 DEMO_DIR = os.path.normpath(os.path.join(_HERE, "..", "demo"))
 
 
+def score_product(product: dict, tokens: list[str]) -> int:
+    """v0.1 ranking score: count of query tokens in the listing text."""
+    hay = " ".join([
+        product["name"], product["category"], product["description"],
+        *[str(v) for v in product["attributes"].values()],
+    ]).lower()
+    return sum(1 for t in tokens if t in hay)
+
+
+def rank_products(products: list[dict], query: str,
+                  max_results: int) -> list[dict]:
+    """Deterministic ranking shared by every Store backend, so results are
+    identical whether the catalog lives in memory or in SQLite."""
+    tokens = [t for t in query.lower().split() if t]
+    scored = [(score_product(p, tokens), p) for p in products]
+    scored = [(s, p) for s, p in scored if s or not tokens]
+    scored.sort(key=lambda sp: (-sp[0], sp[1]["name"]))
+    return [p for _, p in scored[:max_results]]
+
+
 class Catalog:
     def __init__(self, merchant: dict, products: dict[str, dict],
                  reports: dict[str, dict], merchant_key: bytes) -> None:
@@ -29,20 +49,12 @@ class Catalog:
 
     def search(self, query: str, category: str | None = None,
                max_results: int = 10) -> list[dict]:
-        tokens = [t for t in query.lower().split() if t]
-        hits: list[tuple[int, dict]] = []
-        for pid, p in self.products.items():
-            if category and p["category"].lower() != category.lower():
-                continue
-            hay = " ".join([
-                p["name"], p["category"], p["description"],
-                *[str(v) for v in p["attributes"].values()],
-            ]).lower()
-            score = sum(1 for t in tokens if t in hay)
-            if score or not tokens:
-                hits.append((score, p))
-        hits.sort(key=lambda h: (-h[0], h[1]["name"]))
-        return [self.summary(p) for _, p in hits[:max_results]]
+        products = list(self.products.values())
+        if category:
+            products = [p for p in products
+                        if p["category"].lower() == category.lower()]
+        return [self.summary(p)
+                for p in rank_products(products, query, max_results)]
 
     def summary(self, p: dict) -> dict:
         return {
@@ -76,16 +88,9 @@ def load_demo(demo_dir: str = DEMO_DIR) -> Catalog:
     merchant = _read_json(os.path.join(demo_dir, "merchant.json"))
     raw_products = _read_json(os.path.join(demo_dir, "products.json"))
     key = merchant["hmac_key"].encode("utf-8")
-    products: dict[str, dict] = {}
-    reports: dict[str, dict] = {}
-    for raw in raw_products:
-        # Schema failures at load are merchant bugs: skip loudly, don't crash.
-        try:
-            clean, report = firewall.sanitize_listing(raw, key)
-        except firewall.SchemaError as exc:
-            pid = raw.get("product_id", "?")
-            print("catalog: dropping invalid listing %s: %s" % (pid, exc))
-            continue
-        products[clean["product_id"]] = clean
-        reports[clean["product_id"]] = report
+    # sanitize_listings is the parallelizable batch entry point; the
+    # per-listing pure function is what a worker pool would map over.
+    clean = firewall.sanitize_listings(raw_products, key)
+    products = {p["product_id"]: p for p, _ in clean}
+    reports = {p["product_id"]: r for p, r in clean}
     return Catalog(merchant, products, reports, key)

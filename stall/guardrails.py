@@ -58,6 +58,64 @@ class GuardrailConfig:
         }
 
 
+def evaluate_caps(
+    total_cents: int,
+    merchant_id: str,
+    merchant_spend_cents: int,
+    day_spend_cents: int,
+    config: "GuardrailConfig",
+    approval: bool = False,
+) -> tuple[bool, str | None]:
+    """Pure spending policy: no I/O, no state.
+
+    Takes the already-known spend totals so any backend (in-memory dicts,
+    SQLite, Postgres) can evaluate inside its own atomic transaction.
+    Returns (allowed, reason); reason is None when allowed.
+    """
+    if total_cents <= 0:
+        return False, "cart total must be positive"
+    if total_cents > config.max_per_purchase_cents:
+        return (
+            False,
+            "exceeds per-purchase cap: %s > %s limit"
+            % (cents_to_str(total_cents),
+               cents_to_str(config.max_per_purchase_cents)),
+        )
+    if merchant_spend_cents + total_cents > config.max_per_merchant_cents:
+        return (
+            False,
+            "exceeds per-merchant cap: %s already spent with this merchant, "
+            "+ %s would pass the %s limit"
+            % (
+                cents_to_str(merchant_spend_cents),
+                cents_to_str(total_cents),
+                cents_to_str(config.max_per_merchant_cents),
+            ),
+        )
+    if day_spend_cents + total_cents > config.max_daily_cents:
+        return (
+            False,
+            "exceeds daily cap: %s already spent today, + %s would pass "
+            "the %s limit"
+            % (
+                cents_to_str(day_spend_cents),
+                cents_to_str(total_cents),
+                cents_to_str(config.max_daily_cents),
+            ),
+        )
+    if total_cents > config.approval_threshold_cents and not approval:
+        return (
+            False,
+            "requires explicit approval: %s exceeds the %s "
+            "approval threshold (pass budget_approval=true)"
+            % (
+                cents_to_str(total_cents),
+                cents_to_str(config.approval_threshold_cents),
+            ),
+        )
+    return True, None
+
+
 class GuardrailState:
     """Tracks spend against the caps. In-memory for v0.1."""
 
@@ -78,53 +136,17 @@ class GuardrailState:
         """Check a prospective purchase. Returns (allowed, reason).
 
         `reason` is None when allowed, otherwise an exact human-readable
-        explanation of which cap fired.
+        explanation of which cap fired. Delegates to the backend-agnostic
+        evaluate_caps so the policy is identical everywhere.
         """
-        if total_cents <= 0:
-            return False, "cart total must be positive"
-        if total_cents > config.max_per_purchase_cents:
-            return (
-                False,
-                "exceeds per-purchase cap: %s > %s limit"
-                % (cents_to_str(total_cents),
-                   cents_to_str(config.max_per_purchase_cents)),
-            )
-        merchant_spend = self.per_merchant_cents.get(merchant_id, 0)
-        if merchant_spend + total_cents > config.max_per_merchant_cents:
-            return (
-                False,
-                "exceeds per-merchant cap: %s already spent with this merchant, "
-                "+ %s would pass the %s limit"
-                % (
-                    cents_to_str(merchant_spend),
-                    cents_to_str(total_cents),
-                    cents_to_str(config.max_per_merchant_cents),
-                ),
-            )
-        today = self._today()
-        day_spend = self.daily_cents.get(today, 0)
-        if day_spend + total_cents > config.max_daily_cents:
-            return (
-                False,
-                "exceeds daily cap: %s already spent today, + %s would pass "
-                "the %s limit"
-                % (
-                    cents_to_str(day_spend),
-                    cents_to_str(total_cents),
-                    cents_to_str(config.max_daily_cents),
-                ),
-            )
-        if total_cents > config.approval_threshold_cents and not approval:
-            return (
-                False,
-                "requires explicit approval: %s exceeds the %s "
-                "approval threshold (pass budget_approval=true)"
-                % (
-                    cents_to_str(total_cents),
-                    cents_to_str(config.approval_threshold_cents),
-                ),
-            )
-        return True, None
+        return evaluate_caps(
+            total_cents,
+            merchant_id,
+            self.per_merchant_cents.get(merchant_id, 0),
+            self.daily_cents.get(self._today(), 0),
+            config,
+            approval=approval,
+        )
 
     def record(self, total_cents: int, merchant_id: str) -> None:
         self.per_merchant_cents[merchant_id] = (

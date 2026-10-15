@@ -214,6 +214,27 @@ def verify_signature(raw: dict, key: bytes) -> bool:
 # sanitize: the firewall entry point
 # ---------------------------------------------------------------------------
 
+def sanitize_listings(raw_products: list[dict],
+                      merchant_key: bytes) -> list[tuple[dict, dict]]:
+    """Firewall a batch of raw listings.
+
+    Pure per-listing function: each listing is sanitized independently, so
+    this is embarrassingly parallel — at catalog scale, run it in a worker
+    pool (e.g. multiprocessing.Pool.map over chunks of raw listings) and
+    bulk-insert the results. Schema failures are collected, not raised:
+    returns (clean, report) pairs for valid listings only, printing a loud
+    skip line for merchant-bug listings.
+    """
+    out: list[tuple[dict, dict]] = []
+    for raw in raw_products:
+        try:
+            out.append(sanitize_listing(raw, merchant_key))
+        except SchemaError as exc:
+            pid = raw.get("product_id", "?") if isinstance(raw, dict) else "?"
+            print("firewall: dropping invalid listing %s: %s" % (pid, exc))
+    return out
+
+
 def sanitize_listing(raw: dict, merchant_key: bytes) -> tuple[dict, dict]:
     """Run a raw merchant listing through the firewall.
 
