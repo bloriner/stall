@@ -128,14 +128,15 @@ class TestAtomicLedger(StoreTestBase):
         lock = threading.Lock()
 
         def attempt(i):
-            receipt = sign_receipt(
-                key=RECEIPT_KEY, merchant_id=mid, items=[],
-                total_cents=10_000, currency="USD",
-                agent_id="race-agent", prev_hash=GENESIS_HASH,
-                receipt_id="race-%s-%d" % (backend, i))
-            ok, reason = store.commit_purchase(
+            def build(prev_hash):
+                return sign_receipt(
+                    key=RECEIPT_KEY, merchant_id=mid, items=[],
+                    total_cents=10_000, currency="USD",
+                    agent_id="race-agent", prev_hash=prev_hash,
+                    receipt_id="race-%s-%d" % (backend, i))
+            ok, reason, _receipt = store.commit_purchase(
                 total_cents=10_000, merchant_id=mid, config=cfg,
-                approval=True, receipt=receipt)
+                approval=True, receipt_builder=build)
             with lock:
                 results.append(ok)
 
