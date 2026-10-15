@@ -1,0 +1,7 @@
+{
+  "merchant_id": "demo-merchant",
+  "name": "Demo Merchant",
+  "since": "2026-10-15",
+  "hmac_key": "demo-merchant-key-001",
+  "description": "A demo merchant for Stall v0.1. Sells honest goods and, for firewall demonstration purposes, two adversarial listings."
+}
