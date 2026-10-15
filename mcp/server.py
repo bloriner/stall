@@ -35,7 +35,7 @@ import sys
 
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "stall-mcp"
-SERVER_VERSION = "0.2.0"
+SERVER_VERSION = "1.0.0"
 AGENT_ID = "stall-demo-agent"
 MAX_QTY = 99
 
@@ -194,23 +194,29 @@ def tool_stall_checkout(args: dict) -> dict:
         }
         for line in summary["items"]
     ]
-    receipt = sign_receipt(
-        key=_RECEIPT_KEY,
-        merchant_id=merchant_id,
-        items=receipt_items,
-        total_cents=total_cents,
-        currency="USD",
-        agent_id=AGENT_ID,
-        prev_hash=STORE.last_receipt_hash(),
-    )
-    # Atomic: caps are checked and the spend recorded in ONE transaction —
-    # concurrent checkouts cannot slip between check and charge.
-    allowed, reason = STORE.commit_purchase(
+
+    def _build_receipt(prev_hash: str) -> dict:
+        # Called INSIDE the store's atomic commit with the fresh chain
+        # head, so concurrent checkouts can never fork the receipt chain.
+        return sign_receipt(
+            key=_RECEIPT_KEY,
+            merchant_id=merchant_id,
+            items=receipt_items,
+            total_cents=total_cents,
+            currency="USD",
+            agent_id=AGENT_ID,
+            prev_hash=prev_hash,
+        )
+
+    # Atomic: caps are checked, the receipt is chained, and the spend is
+    # recorded in ONE transaction — concurrent checkouts cannot slip
+    # between check and charge, and the chain cannot fork.
+    allowed, reason, receipt = STORE.commit_purchase(
         total_cents=total_cents,
         merchant_id=merchant_id,
         config=GUARDRAILS,
         approval=approval,
-        receipt=receipt,
+        receipt_builder=_build_receipt,
     )
     if not allowed:
         return error_payload("E403", "guardrail_rejected: %s" % reason)
@@ -218,7 +224,7 @@ def tool_stall_checkout(args: dict) -> dict:
     return {
         "receipt": receipt,
         "total": cents_to_str(total_cents),
-        "note": "v0.1 demo receipt: signed purchase intent, no real payment "
+        "note": "demo receipt: signed purchase intent, no real payment "
                 "settled (x402 rail is future work).",
     }
 
@@ -376,11 +382,20 @@ def _call_tool(name: str, args: dict) -> dict:
 
 def handle(msg: dict):
     """Return a JSON-RPC response dict, or None for notifications."""
-    if not isinstance(msg, dict) or msg.get("jsonrpc") != "2.0" or "method" not in msg:
+    if not isinstance(msg, dict):
+        # No addressable id — log and drop.
+        print("invalid JSON-RPC message (not an object)", file=sys.stderr)
+        return None
+    if msg.get("jsonrpc") != "2.0" or "method" not in msg:
+        if "id" in msg:
+            return _err(msg.get("id"), -32600, "Invalid Request")
         return None
     method = msg["method"]
     msg_id = msg.get("id")
-    is_notification = "id" not in msg
+    if "id" not in msg:
+        # Notification: never respond (JSON-RPC 2.0). The server is
+        # stateless, so notifications carry no side effects either.
+        return None
 
     if method == "initialize":
         return _ok(
@@ -391,8 +406,6 @@ def handle(msg: dict):
                 "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
             },
         )
-    if method == "notifications/initialized":
-        return None
     if method == "ping":
         return _ok(msg_id, {})
     if method == "tools/list":
@@ -403,14 +416,10 @@ def handle(msg: dict):
         ]
         return _ok(msg_id, {"tools": tools})
     if method == "tools/call":
-        if is_notification:
-            return None
         params = msg.get("params") or {}
         name = params.get("name")
         args = params.get("arguments") or {}
         return _ok(msg_id, _call_tool(name, args))
-    if is_notification:
-        return None
     return _err(msg_id, -32601, "Method not found: %s" % method)
 
 
@@ -425,6 +434,9 @@ def serve() -> None:
             msg = json.loads(line)
         except json.JSONDecodeError as exc:
             print("invalid JSON-RPC line: %s" % exc, file=sys.stderr)
+            stdout.write(json.dumps(
+                _err(None, -32700, "Parse error")) + "\n")
+            stdout.flush()
             continue
         try:
             resp = handle(msg)
