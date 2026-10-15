@@ -6,13 +6,19 @@ Speaks MCP over newline-delimited JSON-RPC 2.0 on stdin/stdout
 Exposes a demo merchant's catalog to AI shopping agents — every listing the
 agent sees has already passed through the listing firewall at load time.
 
+v0.2: the server is stateless. All session state (carts, spend ledger,
+receipts) lives in a Store backend — SQLite with an FTS5 product index by
+default (STALL_DB overrides the path), STALL_STORE=memory for tests.
+Checkout guardrails are enforced atomically inside the store transaction.
+
 Security notes:
   - Totals are computed server-side from the sanitized catalog. The agent
     can never set prices.
   - Spending guardrails are enforced at checkout (per-purchase, per-merchant,
-    daily caps + an approval threshold).
+    daily caps + an approval threshold). Check and charge happen in ONE
+    atomic transaction — concurrent checkouts cannot overspend.
   - Receipts are HMAC-chained and tamper-evident.
-  - v0.1 has no real payment rail: checkout produces a signed *purchase
+  - v0.2 has no real payment rail: checkout produces a signed *purchase
     intent* receipt. x402 settlement is future work (see README).
 
 Run:
@@ -25,11 +31,11 @@ from __future__ import annotations
 import json
 import os
 import sys
-import uuid
+
 
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "stall-mcp"
-SERVER_VERSION = "0.1.0"
+SERVER_VERSION = "0.2.0"
 AGENT_ID = "stall-demo-agent"
 MAX_QTY = 99
 
@@ -43,29 +49,22 @@ def _ensure_repo_on_path() -> None:
 
 _ensure_repo_on_path()
 
-from stall import catalog as catalog_mod  # noqa: E402
-from stall import guardrails  # noqa: E402
 from stall.guardrails import (  # noqa: E402
     GuardrailConfig,
-    GuardrailState,
     cents_to_str,
-    receipt_hash,
     sign_receipt,
-    verify_chain,
-    GENESIS_HASH,
 )
+from stall import store as store_mod  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
-# state
+# state — everything session-scoped lives in the store, so this process is
+# stateless and N servers can run behind a load balancer.
 # ---------------------------------------------------------------------------
 
-CATALOG = catalog_mod.load_demo()
+STORE = store_mod.make_store()   # SQLite file by default; STALL_DB overrides,
+                                 # STALL_STORE=memory for tests/demos
 GUARDRAILS = GuardrailConfig()
-SPEND = GuardrailState()
-CARTS: dict[str, dict[str, int]] = {}          # cart_id -> {product_id: qty}
-RECEIPTS: list[dict] = []                      # HMAC-chained receipts
-_LAST_HASH = GENESIS_HASH
 
 # The receipt-signing key. DEMO ONLY — production keys live server-side in
 # the hosted service, never in the repo.
@@ -87,16 +86,24 @@ def error_payload(code: str, message: str) -> dict:
 
 def _get_cart(args: dict) -> tuple[str, dict[str, int]]:
     cart_id = args.get("cart_id")
-    if not isinstance(cart_id, str) or cart_id not in CARTS:
+    items = STORE.get_cart(cart_id) if isinstance(cart_id, str) else None
+    if items is None:
         raise KeyError("unknown cart_id")
-    return cart_id, CARTS[cart_id]
+    return cart_id, items
+
+
+def _get_product_or_raise(product_id) -> dict:
+    p = STORE.get_product(product_id) if isinstance(product_id, str) else None
+    if p is None:
+        raise KeyError("unknown product_id: %r" % (product_id,))
+    return p
 
 
 def _cart_summary(cart_id: str, items: dict[str, int]) -> dict:
     lines = []
     total = 0
     for pid, qty in items.items():
-        p = CATALOG.products[pid]
+        p = _get_product_or_raise(pid)
         line_total = p["price_cents"] * qty
         total += line_total
         lines.append({
@@ -126,40 +133,38 @@ def tool_stall_search_products(args: dict) -> dict:
     if isinstance(max_results, bool) or not isinstance(max_results, int):
         raise ValueError("'max_results' must be an integer")
     max_results = max(1, min(50, max_results))
-    results = CATALOG.search(query, category=category, max_results=max_results)
+    results = STORE.search_products(query, category=category,
+                                    max_results=max_results)
     return {"results": results, "count": len(results)}
 
 
 def tool_stall_get_product(args: dict) -> dict:
-    product_id = args.get("product_id")
-    if not isinstance(product_id, str) or product_id not in CATALOG.products:
-        raise KeyError("unknown product_id: %r" % (product_id,))
+    product = _get_product_or_raise(args.get("product_id"))
     return {
-        "product": CATALOG.products[product_id],
-        "firewall_report": CATALOG.reports[product_id],
+        "product": product,
+        "firewall_report": STORE.firewall_report(product["product_id"]),
     }
 
 
 def tool_stall_create_cart(args: dict) -> dict:
-    cart_id = uuid.uuid4().hex
-    CARTS[cart_id] = {}
-    return {"cart_id": cart_id}
+    return {"cart_id": STORE.create_cart()}
 
 
 def tool_stall_add_to_cart(args: dict) -> dict:
     cart_id, items = _get_cart(args)
     product_id = args.get("product_id")
-    if not isinstance(product_id, str) or product_id not in CATALOG.products:
-        raise KeyError("unknown product_id: %r" % (product_id,))
+    _get_product_or_raise(product_id)
     qty = args.get("qty", 1)
     if isinstance(qty, bool) or not isinstance(qty, int):
         raise ValueError("'qty' must be an integer")
     if not 1 <= qty <= MAX_QTY:
         raise ValueError("'qty' must be between 1 and %d" % MAX_QTY)
-    items[product_id] = items.get(product_id, 0) + qty
-    if items[product_id] > MAX_QTY:
-        items[product_id] = MAX_QTY
-    return _cart_summary(cart_id, items)
+    # v0.1 semantics: stored line qty is clamped at MAX_QTY
+    new_qty = min(items.get(product_id, 0) + qty, MAX_QTY)
+    delta = new_qty - items.get(product_id, 0)
+    if delta > 0:
+        STORE.add_to_cart(cart_id, product_id, delta)
+    return _cart_summary(cart_id, STORE.get_cart(cart_id))
 
 
 def tool_stall_get_cart(args: dict) -> dict:
@@ -168,7 +173,6 @@ def tool_stall_get_cart(args: dict) -> dict:
 
 
 def tool_stall_checkout(args: dict) -> dict:
-    global _LAST_HASH
     cart_id, items = _get_cart(args)
     if not items:
         return error_payload("E400", "cart is empty")
@@ -178,13 +182,7 @@ def tool_stall_checkout(args: dict) -> dict:
 
     summary = _cart_summary(cart_id, items)
     total_cents = summary["total_cents"]
-    merchant_id = CATALOG.merchant_id
-
-    allowed, reason = SPEND.evaluate(
-        total_cents, merchant_id, GUARDRAILS, approval=approval
-    )
-    if not allowed:
-        return error_payload("E403", "guardrail_rejected: %s" % reason)
+    merchant_id = STORE.merchant_id()
 
     receipt_items = [
         {
@@ -203,12 +201,20 @@ def tool_stall_checkout(args: dict) -> dict:
         total_cents=total_cents,
         currency="USD",
         agent_id=AGENT_ID,
-        prev_hash=_LAST_HASH,
+        prev_hash=STORE.last_receipt_hash(),
     )
-    _LAST_HASH = receipt_hash(receipt)
-    RECEIPTS.append(receipt)
-    SPEND.record(total_cents, merchant_id)
-    del CARTS[cart_id]
+    # Atomic: caps are checked and the spend recorded in ONE transaction —
+    # concurrent checkouts cannot slip between check and charge.
+    allowed, reason = STORE.commit_purchase(
+        total_cents=total_cents,
+        merchant_id=merchant_id,
+        config=GUARDRAILS,
+        approval=approval,
+        receipt=receipt,
+    )
+    if not allowed:
+        return error_payload("E403", "guardrail_rejected: %s" % reason)
+    STORE.delete_cart(cart_id)
     return {
         "receipt": receipt,
         "total": cents_to_str(total_cents),
@@ -218,16 +224,16 @@ def tool_stall_checkout(args: dict) -> dict:
 
 
 def tool_stall_get_merchant(args: dict) -> dict:
-    merchant_id = args.get("merchant_id", CATALOG.merchant_id)
-    if merchant_id != CATALOG.merchant_id:
+    merchant_id = args.get("merchant_id", STORE.merchant_id())
+    if merchant_id != STORE.merchant_id():
         raise KeyError("unknown merchant_id: %r" % (merchant_id,))
-    m = CATALOG.merchant
+    m = STORE.merchant()
     return {
         "merchant_id": m["merchant_id"],
         "name": m["name"],
         "since": m["since"],
         "description": m.get("description", ""),
-        "trust": CATALOG.firewall_stats(),
+        "trust": STORE.firewall_stats(),
     }
 
 
