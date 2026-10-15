@@ -39,6 +39,20 @@ SERVER_VERSION = "1.0.0"
 AGENT_ID = "stall-demo-agent"
 MAX_QTY = 99
 
+#: Hard cap on the serialized size of a tool call's arguments. Anything
+#: bigger is rejected with JSON-RPC -32602 before it is parsed or
+#: dispatched — oversized inputs never reach the tools.
+MAX_ARGUMENTS_BYTES = 64 * 1024
+
+
+class InvalidParamsError(ValueError):
+    """A tool call's arguments failed schema validation.
+
+    Subclasses ValueError so existing ValueError handlers keep working,
+    but tools/call translates it into a JSON-RPC -32602 error (with
+    isError=true in the response) instead of a tool-level error result.
+    """
+
 
 def _ensure_repo_on_path() -> None:
     here = os.path.dirname(os.path.abspath(__file__))
@@ -352,27 +366,94 @@ def _err(msg_id, code, message):
     return {"jsonrpc": "2.0", "id": msg_id, "error": {"code": code, "message": message}}
 
 
-def _call_tool(name: str, args: dict) -> dict:
+def _param_error(msg_id, exc: InvalidParamsError):
+    """JSON-RPC -32602 Invalid params, with isError=true in the response."""
+    return {
+        "jsonrpc": "2.0",
+        "id": msg_id,
+        "error": {"code": -32602,
+                  "message": "Invalid params: %s" % _truncate(str(exc))},
+        "isError": True,
+    }
+
+
+def _check_arg_type(value, want: str, name: str) -> None:
+    if want == "string":
+        ok = isinstance(value, str)
+    elif want == "integer":
+        ok = isinstance(value, int) and not isinstance(value, bool)
+    elif want == "boolean":
+        ok = isinstance(value, bool)
+    else:
+        ok = True  # undeclared schema type: don't gate on it
+    if not ok:
+        raise InvalidParamsError(
+            "'%s' must be %s, got %s" % (name, want, type(value).__name__))
+
+
+def _validate_arguments(tool_name: str, args) -> dict:
+    """Validate tools/call arguments against the tool's inputSchema.
+
+    Raises InvalidParamsError on anything invalid — non-object arguments,
+    oversized inputs, unknown or missing properties, wrong types, or
+    minimum/maximum violations. The dispatcher turns it into a JSON-RPC
+    -32602 error with isError=true in the response.
+    """
+    tool = TOOLS[tool_name]  # KeyError impossible: caller checked membership
+    if not isinstance(args, dict):
+        raise InvalidParamsError(
+            "arguments must be an object, got %s" % type(args).__name__)
+    size = len(json.dumps(args, ensure_ascii=False, default=str).encode("utf-8"))
+    if size > MAX_ARGUMENTS_BYTES:
+        raise InvalidParamsError(
+            "arguments too large: %d bytes (max %d)"
+            % (size, MAX_ARGUMENTS_BYTES))
+    schema = tool["inputSchema"] or {}
+    props = schema.get("properties") or {}
+    for key in args:
+        if key not in props:
+            raise InvalidParamsError("unknown argument: %r" % (key,))
+    for key in schema.get("required") or []:
+        if key not in args:
+            raise InvalidParamsError("missing required argument: %r" % (key,))
+    for key, value in args.items():
+        spec = props.get(key) or {}
+        _check_arg_type(value, spec.get("type", "string"), key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            if "minimum" in spec and value < spec["minimum"]:
+                raise InvalidParamsError(
+                    "'%s' below minimum %s" % (key, spec["minimum"]))
+            if "maximum" in spec and value > spec["maximum"]:
+                raise InvalidParamsError(
+                    "'%s' above maximum %s" % (key, spec["maximum"]))
+    return args
+
+
+def _tool_error_result(code: str, message: str) -> dict:
+    """Tool-level error result (business error, not a protocol error)."""
+    return {
+        "content": [{"type": "text", "text": json.dumps(
+            error_payload(code, message))}],
+        "isError": True,
+    }
+
+
+def _call_tool(name: str, args) -> dict:
+    tool = TOOLS.get(name)
+    if tool is None:
+        # Unknown tool: tool-level error result per MCP convention.
+        return _tool_error_result("E400", "unknown tool: %r" % (name,))
+    # Schema validation first. InvalidParamsError propagates to handle(),
+    # which answers with a JSON-RPC -32602 error (+ isError=true).
+    _validate_arguments(name, args)
     try:
-        tool = TOOLS.get(name)
-        if tool is None:
-            raise KeyError("unknown tool: %s" % name)
-        if not isinstance(args, dict):
-            args = {}
         payload = tool["fn"](args)
     except (ValueError, KeyError) as exc:
-        return {
-            "content": [{"type": "text", "text": json.dumps(
-                error_payload("E400", str(exc)))}],
-            "isError": True,
-        }
+        return _tool_error_result("E400", str(exc))
     except Exception as exc:  # never leak tracebacks
-        return {
-            "content": [{"type": "text", "text": json.dumps(
-                error_payload("E999", "%s: %s" % (
-                    type(exc).__name__, _truncate(str(exc) or "unknown"))))}],
-            "isError": True,
-        }
+        return _tool_error_result(
+            "E999", "%s: %s" % (type(exc).__name__,
+                                _truncate(str(exc) or "unknown")))
     text = json.dumps(payload)
     result = {"content": [{"type": "text", "text": text}]}
     if isinstance(payload, dict) and "error" in payload:
@@ -419,7 +500,11 @@ def handle(msg: dict):
         params = msg.get("params") or {}
         name = params.get("name")
         args = params.get("arguments") or {}
-        return _ok(msg_id, _call_tool(name, args))
+        try:
+            result = _call_tool(name, args)
+        except InvalidParamsError as exc:
+            return _param_error(msg_id, exc)
+        return _ok(msg_id, result)
     return _err(msg_id, -32601, "Method not found: %s" % method)
 
 

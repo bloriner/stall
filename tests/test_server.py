@@ -65,6 +65,12 @@ class ServerProc:
         payload = json.loads(result["content"][0]["text"])
         return payload, result.get("isError", False)
 
+    def tool_raw(self, name, arguments=None):
+        """Full JSON-RPC response for a tools/call (covers -32602 errors,
+        which carry no 'result')."""
+        return self.call("tools/call",
+                         {"name": name, "arguments": arguments or {}})
+
     def close(self):
         try:
             self.proc.stdin.close()
@@ -195,13 +201,58 @@ class TestServer(unittest.TestCase):
         self.assertGreaterEqual(trust["listings_sanitized"], 2)  # widget-x9 + gadget-x1
 
     def test_bad_args_error_cleanly(self):
-        _, is_err = self.srv.tool(
+        # unknown cart_id is a *business* error -> tool-level isError result
+        payload, is_err = self.srv.tool(
             "stall_add_to_cart",
             {"cart_id": "bogus", "product_id": "mouse-w1", "qty": 1})
         self.assertTrue(is_err)
-        _, is_err = self.srv.tool(
+        self.assertIn("error", payload)
+        # wrong-typed argument is a *protocol* error -> -32602 + isError
+        resp = self.srv.tool_raw(
             "stall_search_products", {"query": 123})
-        self.assertTrue(is_err)
+        self.assertNotIn("result", resp)
+        self.assertEqual(resp["error"]["code"], -32602)
+        self.assertTrue(resp.get("isError"))
+
+    def test_invalid_args_rejected_with_32602_and_is_error(self):
+        """Conformance finding: invalid tool arguments must be rejected
+        with JSON-RPC -32602 AND isError=true in the response."""
+        cases = [
+            ("stall_search_products", {"query": 123}),            # wrong type
+            ("stall_search_products", {"query": "x", "bogus": 1}),  # unknown arg
+            ("stall_search_products", {"query": "x", "max_results": "many"}),
+            ("stall_get_product", {}),                            # missing required
+            ("stall_get_product", {"product_id": 42}),            # wrong type
+            ("stall_add_to_cart",                                  # qty wrong type
+             {"cart_id": "c", "product_id": "mouse-w1", "qty": "two"}),
+            ("stall_add_to_cart",                                  # qty above max
+             {"cart_id": "c", "product_id": "mouse-w1", "qty": 500}),
+            ("stall_checkout", {"cart_id": "c", "budget_approval": "yes"}),
+            ("stall_search_products", ["not", "a", "dict"]),       # non-object args
+        ]
+        for name, arguments in cases:
+            with self.subTest(tool=name, arguments=str(arguments)[:60]):
+                resp = self.srv.tool_raw(name, arguments)
+                self.assertNotIn("result", resp)
+                self.assertEqual(resp["error"]["code"], -32602)
+                self.assertIn("Invalid params", resp["error"]["message"])
+                self.assertTrue(resp.get("isError"))
+
+    def test_oversized_arguments_rejected(self):
+        """Conformance finding: tool arguments need a size cap. Anything
+        over MAX_ARGUMENTS_BYTES is rejected with -32602 + isError."""
+        big = "x" * (70 * 1024)  # 70 KiB > 64 KiB cap
+        resp = self.srv.tool_raw("stall_search_products", {"query": big})
+        self.assertNotIn("result", resp)
+        self.assertEqual(resp["error"]["code"], -32602)
+        self.assertIn("too large", resp["error"]["message"])
+        self.assertTrue(resp.get("isError"))
+        # just under the cap still works
+        ok_query = "x" * (60 * 1024)
+        payload, is_err = self.srv.tool(
+            "stall_search_products", {"query": ok_query})
+        self.assertFalse(is_err)
+        self.assertIn("results", payload)
 
 
 if __name__ == "__main__":
