@@ -26,6 +26,7 @@ import hashlib
 import hmac
 import json
 import re
+import unicodedata
 
 # ---------------------------------------------------------------------------
 # schema
@@ -100,31 +101,155 @@ def _split_sentences(text: str) -> list[str]:
     return [p.strip() for p in parts if p.strip()]
 
 
+# ---------------------------------------------------------------------------
+# unicode normalization for scanning
+#
+# Attackers evade regex patterns with invisible characters (zero-width
+# space U+200B, zero-width joiner, word joiner...), compatibility forms
+# (fullwidth "Ｉ" vs "I"), and script-mixing homoglyphs (Cyrillic "і" vs
+# Latin "i"). Defense, applied BEFORE pattern matching:
+#   1. NFKC — folds compatibility forms (fullwidth, ligatures, etc.)
+#   2. Strip Unicode category Cf (format/invisible chars) — they have no
+#      legitimate use in a product listing
+#   3. Confusables fold — a small table of Cyrillic/Greek Latin-lookalikes
+#      that NFKC does not unify, applied for SCANNING ONLY
+#   4. Whitespace collapse — so a trigger phrase split across lines
+#      ("Ignore previous\ninstructions") still scans as one line
+# A full Unicode confusables table (UTS #39) is future work; the residual
+# risk is documented in notes/threat-model.md.
+# ---------------------------------------------------------------------------
+
+_CONFUSABLES = {
+    # Cyrillic lookalikes -> Latin
+    "а": "a", "е": "e", "і": "i", "о": "o", "р": "p", "с": "c",
+    "х": "x", "у": "y", "к": "k", "м": "m", "н": "h", "т": "t",
+    "в": "b", "з": "z", "д": "d", "л": "n",
+    "А": "A", "В": "B", "Е": "E", "Н": "H", "К": "K", "М": "M",
+    "О": "O", "Р": "P", "С": "C", "Т": "T", "Х": "X",
+    # Greek lookalikes -> Latin
+    "α": "a", "ε": "e", "ι": "i", "ο": "o", "ρ": "p", "τ": "t",
+    "υ": "u", "χ": "x", "ν": "v", "κ": "k", "μ": "m", "η": "n",
+    "ζ": "z",
+    "Α": "A", "Β": "B", "Ε": "E", "Ζ": "Z", "Η": "H", "Ι": "I",
+    "Κ": "K", "Μ": "M", "Ν": "N", "Ο": "O", "Ρ": "P", "Τ": "T",
+    "Υ": "Y", "Χ": "X",
+}
+_CONFUSABLES_TRANS = str.maketrans(_CONFUSABLES)
+
+_WS_COLLAPSE_RE = re.compile(r"\s+")
+
+
+def _clean_invisible(text: str) -> str:
+    """Delete invisible format characters (Unicode category Cf: zero-width
+    spaces, joiners, word joiners, BOMs), then collapse all whitespace runs.
+
+    Cf chars are a classic evasion vector ("Ig\\u200bnore previous
+    instructions"). They are DELETED (not spaced) because that matches the
+    most dangerous downstream interpretation: LLM tokenizers typically
+    drop zero-width characters, so the agent would read "Ignore" — and the
+    firewall must see exactly what the agent would see. They have no
+    legitimate use in a product listing, so the agent never sees them
+    either way. Residual risk (word-joiner gluing: "Ignore\\u2060previous"
+    -> "Ignoreprevious") is documented in notes/threat-model.md: the glued
+    blob is not parseable as an instruction by the agent either."""
+    t = "".join(ch for ch in text if unicodedata.category(ch) != "Cf")
+    return _WS_COLLAPSE_RE.sub(" ", t).strip()
+
+
+def _normalize_for_scan(text: str, cf_to_space: bool = False) -> str:
+    """Aggressive normalization for injection scanning ONLY.
+
+    NFKC folds compatibility forms (fullwidth -> ASCII); a small
+    confusables table folds Cyrillic/Greek Latin-lookalikes that NFKC
+    misses; whitespace is collapsed so a trigger phrase split across
+    lines still scans as one line.
+
+    cf_to_space controls the invisible-character (Cf) interpretation:
+    False deletes them (matches tokenizers that drop zero-width chars —
+    "Ig\\u200bnore" scans as "Ignore"); True spaces them (matches
+    tokenizers that normalize them to whitespace — "Ignore\\u2060previous"
+    scans as "Ignore previous"). The firewall scans BOTH, because the
+    downstream agent's tokenizer behavior is not ours to assume. Either
+    hit strips the sentence. The agent-facing text always uses the
+    deleted form, so legitimate non-Latin text is never corrupted.
+    """
+    t = unicodedata.normalize("NFKC", text)
+    if cf_to_space:
+        t = "".join(" " if unicodedata.category(ch) == "Cf" else ch
+                    for ch in t)
+    else:
+        t = "".join(ch for ch in t if unicodedata.category(ch) != "Cf")
+    t = t.translate(_CONFUSABLES_TRANS)
+    t = _WS_COLLAPSE_RE.sub(" ", t)
+    return t
+
+
 def scan_text(text: str) -> tuple[str, list[dict]]:
     """Scan one string field. Returns (cleaned_text, findings).
 
+    Two phases:
+      A. Per-sentence: each sentence is pattern-matched against its
+         unicode-normalized form (NFKC + invisible-char strip + confusables
+         fold). Hits are removed and recorded.
+      B. Cross-sentence: the surviving text is whitespace-collapsed and
+         scanned whole, catching trigger phrases deliberately split across
+         sentence/line boundaries ("Ignore previous\\ninstructions"). A hit
+         quarantines the entire field — a merchant splitting an instruction
+         across lines is attacking, not writing copy.
+
     Sentences matching an injection pattern are removed; each removal is
     recorded as {"sentence": ..., "pattern": ...}. Bare URLs are kept but
-    reported as warnings.
+    reported as warnings. Invisible (Cf) characters are stripped from the
+    returned text in all cases.
     """
     if not isinstance(text, str):
         return "", []
+    # Collapse whitespace FIRST (Cf chars intact): a trigger phrase split
+    # across lines ("Ignore previous\\ninstructions") rejoins into one
+    # sentence before scanning.
+    flat = _WS_COLLAPSE_RE.sub(" ", text).strip()
     findings: list[dict] = []
     warnings: list[str] = []
     kept: list[str] = []
-    for sentence in _split_sentences(text):
+    for sentence in _split_sentences(flat):
         hit = None
-        for name, rx in _INJECTION_PATTERNS:
-            if rx.search(sentence):
-                hit = name
+        # Dual interpretation of invisible characters: the downstream
+        # agent's tokenizer may drop them or space them — scan both.
+        scans = (_normalize_for_scan(sentence),
+                 _normalize_for_scan(sentence, cf_to_space=True))
+        for scan in scans:
+            for name, rx in _INJECTION_PATTERNS:
+                if rx.search(scan):
+                    hit = name
+                    break
+            if hit:
                 break
+        clean_sentence = _clean_invisible(sentence)
         if hit:
-            findings.append({"sentence": sentence[:300], "pattern": hit})
+            findings.append({"sentence": clean_sentence[:300],
+                             "pattern": hit})
         else:
-            kept.append(sentence)
-            for url in _URL_RE.findall(sentence):
+            kept.append(clean_sentence)
+            for url in _URL_RE.findall(clean_sentence):
                 warnings.append("bare URL in text: %s" % url[:80])
-    return " ".join(kept), findings + (
+
+    # Phase B: cross-sentence scan on the survivors.
+    joined = _WS_COLLAPSE_RE.sub(" ", " ".join(kept)).strip()
+    if joined:
+        scan_all = _normalize_for_scan(joined)
+        for name, rx in _INJECTION_PATTERNS:
+            m = rx.search(scan_all)
+            if m:
+                findings.append({
+                    "sentence": "<cross-sentence instruction attempt quarantined>",
+                    "pattern": name,
+                    "matched": m.group(0)[:200],
+                })
+                kept = []  # quarantine the whole field
+                break
+
+    cleaned = " ".join(kept)
+    return cleaned, findings + (
         [{"warning": w, "pattern": "bare-url"} for w in warnings]
     )
 
@@ -199,10 +324,14 @@ def canonical_json(product: dict) -> bytes:
 
 def sign_listing(product: dict, key: bytes) -> str:
     """HMAC-SHA256 hex signature over the canonical product JSON."""
+    if not key:
+        raise ValueError("signing key must not be empty")
     return hmac.new(key, canonical_json(product), hashlib.sha256).hexdigest()
 
 
 def verify_signature(raw: dict, key: bytes) -> bool:
+    if not key:
+        return False
     sig = raw.get("signature")
     if not isinstance(sig, str) or not sig:
         return False
@@ -247,6 +376,9 @@ def sanitize_listing(raw: dict, merchant_key: bytes) -> tuple[dict, dict]:
       fields_dropped  — unknown schema fields that were discarded
     Raises SchemaError if the listing fails schema validation outright.
     """
+    if not isinstance(raw, dict):
+        raise SchemaError("listing must be an object, got %s"
+                          % type(raw).__name__)
     signature_valid = verify_signature(raw, merchant_key)
     fields_dropped = sorted(
         k for k in raw.keys() if k not in SCHEMA_FIELDS and k != "signature"

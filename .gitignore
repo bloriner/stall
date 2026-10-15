@@ -1,0 +1,8 @@
+# Stall runtime state — never commit
+merchants/
+*.db
+*.db-journal
+*.db-wal
+__pycache__/
+*.pyc
+.DS_Store
