@@ -1,19 +1,41 @@
 #!/usr/bin/env python3
 """MCP server stdio round-trip tests: full shop flow over NDJSON JSON-RPC,
-including the adversarial listings and a guardrail rejection."""
+including the adversarial listings and a guardrail rejection.
+
+Runs against BOTH store backends. STALL_TEST_BACKEND selects:
+  sqlite (default) — fresh temp SQLite file per run
+  memory           — in-memory store
+Run both with:
+  STALL_TEST_BACKEND=sqlite python3 -m unittest discover -s tests
+  STALL_TEST_BACKEND=memory python3 -m unittest discover -s tests
+"""
 
 import json
 import os
 import subprocess
+import tempfile
 import unittest
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+TEST_BACKEND = os.environ.get("STALL_TEST_BACKEND", "sqlite")
 
 
 class ServerProc:
     """A live stall MCP server over stdio."""
 
     def __init__(self):
+        env = dict(os.environ)
+        self._tmpdb = None
+        if TEST_BACKEND == "memory":
+            env["STALL_STORE"] = "memory"
+            env.pop("STALL_DB", None)
+        else:
+            fd, path = tempfile.mkstemp(prefix="stall-test-", suffix=".db")
+            os.close(fd)
+            os.unlink(path)  # let sqlite create it fresh
+            self._tmpdb = path
+            env["STALL_DB"] = path
+            env.pop("STALL_STORE", None)
         self.proc = subprocess.Popen(
             ["python3", "-m", "mcp.server"],
             cwd=REPO_ROOT,
@@ -22,6 +44,7 @@ class ServerProc:
             stderr=subprocess.PIPE,
             text=True,
             bufsize=1,
+            env=env,
         )
         self._next_id = 0
 
@@ -49,6 +72,8 @@ class ServerProc:
             pass
         self.proc.terminate()
         self.proc.wait(timeout=10)
+        if self._tmpdb and os.path.exists(self._tmpdb):
+            os.unlink(self._tmpdb)
 
 
 class TestServer(unittest.TestCase):
