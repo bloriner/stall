@@ -22,10 +22,13 @@ Seams for scale (see notes/scale-architecture.md):
 
 from __future__ import annotations
 
+import functools
+import hashlib
 import json
 import os
 import re
 import sqlite3
+import sys
 import threading
 import uuid
 from abc import ABC, abstractmethod
@@ -91,9 +94,12 @@ class Store(ABC):
     @abstractmethod
     def commit_purchase(self, *, total_cents: int, merchant_id: str,
                         config: GuardrailConfig, approval: bool,
-                        receipt: dict) -> tuple[bool, str | None]:
-        """Atomically evaluate caps and, if allowed, record the spend and
-        store the receipt. Returns (allowed, reason)."""
+                        receipt_builder) -> tuple[bool, str | None, dict | None]:
+        """Atomically evaluate caps and, if allowed, build the receipt,
+        record the spend, and store the receipt. receipt_builder(prev_hash)
+        -> receipt dict is called INSIDE the atomic section with the fresh
+        chain head, so concurrent checkouts can never fork the receipt
+        chain. Returns (allowed, reason, receipt)."""
 
     # -- receipts ------------------------------------------------------
     @abstractmethod
@@ -201,7 +207,7 @@ class MemoryStore(Store):
 
     # -- ledger --
     def commit_purchase(self, *, total_cents, merchant_id, config,
-                        approval, receipt):
+                        approval, receipt_builder):
         from .guardrails import receipt_hash
         today = date.today().isoformat()
         with self._lock:
@@ -211,12 +217,16 @@ class MemoryStore(Store):
                 total_cents, merchant_id, m_spend, d_spend, config,
                 approval=approval)
             if not allowed:
-                return False, reason
+                return False, reason, None
+            # The receipt is built inside the lock with the fresh chain
+            # head: concurrent checkouts serialize here, so the chain can
+            # never fork.
+            receipt = receipt_builder(self._last_hash)
             self._merchant_spend[merchant_id] = m_spend + total_cents
             self._daily_spend[today] = d_spend + total_cents
             self._receipts.append(receipt)
             self._last_hash = receipt_hash(receipt)
-            return True, None
+            return True, None, receipt
 
     def last_receipt_hash(self):
         with self._lock:
@@ -290,6 +300,27 @@ CREATE TABLE IF NOT EXISTS receipts (
 """
 
 
+def _auto_reconnect(fn):
+    """Retry a store write once after recreating a vanished DB file.
+
+    If the sqlite file is deleted mid-run, writes fail with
+    "attempt to write a readonly database". Instead of crashing the
+    server, recreate the file and retry the operation once. Reads keep
+    working off the stale file handle until the next write triggers the
+    reconnect.
+    """
+    @functools.wraps(fn)
+    def wrapper(self, *args, **kwargs):
+        try:
+            return fn(self, *args, **kwargs)
+        except sqlite3.OperationalError as exc:
+            if "readonly" not in str(exc).lower():
+                raise
+            self._reconnect()
+            return fn(self, *args, **kwargs)
+    return wrapper
+
+
 class SQLiteStore(Store):
     """Durable single-node backend.
 
@@ -311,7 +342,16 @@ class SQLiteStore(Store):
         try:
             self._conn.executescript(_SCHEMA)
         except sqlite3.OperationalError as exc:
-            raise RuntimeError("sqlite FTS5 unavailable: %s" % exc)
+            if "fts5" in str(exc).lower():
+                raise RuntimeError("sqlite FTS5 unavailable: %s" % exc)
+            raise RuntimeError(
+                "sqlite database error on %r: %s" % (path, exc))
+        except sqlite3.DatabaseError as exc:
+            # e.g. "file is not a database". Never silently delete user
+            # data: fail loud with the recovery step.
+            raise RuntimeError(
+                "sqlite database %r is corrupt or not a database: %s "
+                "(move it aside to start fresh)" % (path, exc))
 
     # -- internal --
     def _row_to_product(self, row: sqlite3.Row) -> dict:
@@ -326,6 +366,7 @@ class SQLiteStore(Store):
         }
 
     # -- catalog --
+    @_auto_reconnect
     def seed_catalog(self, merchant, raw_products, merchant_key):
         # Firewall first (pure per-listing function — parallelizable), then
         # one transaction for the whole catalog swap.
@@ -442,6 +483,7 @@ class SQLiteStore(Store):
         }
 
     # -- carts --
+    @_auto_reconnect
     def create_cart(self):
         from datetime import datetime, timezone
         cart_id = uuid.uuid4().hex
@@ -463,6 +505,7 @@ class SQLiteStore(Store):
                 (cart_id,)).fetchall()
         return {r["product_id"]: r["qty"] for r in items}
 
+    @_auto_reconnect
     def add_to_cart(self, cart_id, product_id, qty):
         with self._lock:
             if self._conn.execute(
@@ -482,6 +525,7 @@ class SQLiteStore(Store):
                     "INSERT INTO cart_items (cart_id, product_id, qty)"
                     " VALUES (?,?,?)", (cart_id, product_id, qty))
 
+    @_auto_reconnect
     def delete_cart(self, cart_id):
         with self._lock:
             self._conn.execute("DELETE FROM cart_items WHERE cart_id=?",
@@ -489,15 +533,17 @@ class SQLiteStore(Store):
             self._conn.execute("DELETE FROM carts WHERE cart_id=?", (cart_id,))
 
     # -- ledger (the atomic part) --
+    @_auto_reconnect
     def commit_purchase(self, *, total_cents, merchant_id, config,
-                        approval, receipt):
+                        approval, receipt_builder):
         from datetime import datetime, timezone
-        from .guardrails import receipt_hash
         today = date.today().isoformat()
         with self._lock:
             cur = self._conn.cursor()
             # IMMEDIATE takes the write lock up front: no other writer can
-            # slip a spend between our check and our record.
+            # slip a spend between our check and our record, and the
+            # receipt is built here with the fresh chain head, so the
+            # chain can never fork under concurrency.
             cur.execute("BEGIN IMMEDIATE")
             try:
                 m_spend = cur.execute(
@@ -511,7 +557,13 @@ class SQLiteStore(Store):
                     approval=approval)
                 if not allowed:
                     cur.execute("ROLLBACK")
-                    return False, reason
+                    return False, reason, None
+                row = cur.execute(
+                    "SELECT hmac FROM receipts"
+                    " ORDER BY rowid DESC LIMIT 1").fetchone()
+                prev_hash = (hashlib.sha256(
+                    row[0].encode("utf-8")).hexdigest() if row else "0" * 64)
+                receipt = receipt_builder(prev_hash)
                 now = datetime.now(timezone.utc).isoformat(timespec="seconds")
                 cur.execute(
                     "INSERT INTO spend_ledger (merchant_id, day, cents,"
@@ -523,7 +575,7 @@ class SQLiteStore(Store):
                     (receipt["receipt_id"], json.dumps(receipt),
                      receipt.get("prev_hash", ""), receipt.get("hmac", "")))
                 cur.execute("COMMIT")
-                return True, None
+                return True, None, receipt
             except Exception:
                 try:
                     cur.execute("ROLLBACK")
@@ -544,6 +596,24 @@ class SQLiteStore(Store):
     def close(self):
         with self._lock:
             self._conn.close()
+
+    # -- resilience --
+    def _reconnect(self) -> None:
+        """Recreate the database file and schema after it vanished
+        mid-run (deleted file, tmp cleaner, disk hiccup). The store comes
+        back EMPTY — catalog data must be reloaded (see stall.onboard).
+        Never silently recovers data; it only keeps the server serving."""
+        print("stall: database file %r vanished mid-run; recreated empty "
+              "schema (reload the catalog)" % self._path, file=sys.stderr)
+        with self._lock:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+            self._conn = sqlite3.connect(self._path, check_same_thread=False,
+                                         isolation_level=None)
+            self._conn.row_factory = sqlite3.Row
+            self._conn.executescript(_SCHEMA)
 
 
 # ---------------------------------------------------------------------------
