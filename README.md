@@ -166,7 +166,7 @@ returns protocol, restock-agent subscriptions, merchant analytics
   (proper -32600/-32700 errors, no responses to notifications)
 - ✅ SQLite store (FTS5 search) + memory backend, identical ranking
 - ✅ Merchant onboarding CLI (create / sign-catalog / rotate-key / show)
-- ✅ 86 green tests on both backends, including a 10-thread ledger race,
+- ✅ 88 green tests on both backends, including a 10-thread ledger race,
   a 10-thread chain-integrity test, and a 10k-product search sanity check
 - ✅ Resilience: corrupt DB files fail with an actionable error; a DB
   file deleted mid-run is recreated cleanly on the next write
@@ -190,3 +190,7 @@ tests/            test_firewall.py · test_guardrails.py · test_server.py
                               corruption recovery, concurrency, onboarding)
 notes/            threat-model.md · scale-architecture.md
 ```
+
+## License
+
+MIT — see [`LICENSE`](LICENSE).
